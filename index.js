@@ -64,7 +64,10 @@ function createFfmpegStream(url) {
     '-f', 's16le',
     'pipe:1'
   ];
+  console.log(`[DEBUG] Spawning ffmpeg with args:`, args);
+  console.log(`[DEBUG] ffmpeg path: ${ffmpegStatic}`);
   const ff = spawn(ffmpegStatic, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  console.log(`[DEBUG] ffmpeg process spawned, PID: ${ff.pid}`);
 
   ff.on('error', err => {
     console.error('ffmpeg spawn error:', err);
@@ -108,55 +111,107 @@ async function playRadio(voiceChannel) {
     players.delete(guildId);
   }
 
+  console.log(`[DEBUG] Creating voice connection for guild ${guildId}, channel ${voiceChannel.id} (${voiceChannel.name})`);
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: voiceChannel.guild.id,
     adapterCreator: voiceChannel.guild.voiceAdapterCreator
   });
 
+  console.log(`[DEBUG] Voice connection created, state: ${connection.state.status}`);
+
+  // Handle connection state changes
+  connection.on('stateChange', (oldState, newState) => {
+    console.log(`[DEBUG] Voice connection state changed for guild ${guildId}: ${oldState.status} -> ${newState.status}`);
+    if (newState.status === 'disconnected') {
+      console.log(`[DEBUG] Connection disconnected for guild ${guildId}, reason: ${newState.reason}`);
+    }
+  });
+
   // Handle connection errors
   connection.on('error', error => {
-    console.error('Voice connection error:', error);
+    console.error(`[DEBUG] Voice connection error for guild ${guildId}:`, error);
+    console.error(`[DEBUG] Error stack:`, error.stack);
     disconnectGuild(guildId);
   });
 
   const player = createAudioPlayer();
-  connection.subscribe(player);
+  console.log(`[DEBUG] Audio player created for guild ${guildId}`);
+  
+  try {
+    connection.subscribe(player);
+    console.log(`[DEBUG] Subscribed audio player to connection for guild ${guildId}`);
+  } catch (err) {
+    console.error(`[DEBUG] Failed to subscribe player to connection for guild ${guildId}:`, err);
+    throw err;
+  }
 
   // start ffmpeg and pipe into discord
+  console.log(`[DEBUG] Starting ffmpeg stream for guild ${guildId}, URL: ${RADIO_URL}`);
   const ffmpeg = createFfmpegStream(RADIO_URL);
+  console.log(`[DEBUG] ffmpeg process spawned for guild ${guildId}, PID: ${ffmpeg.pid}`);
   
   // Wait a moment to ensure ffmpeg starts successfully
   await new Promise(resolve => setTimeout(resolve, 500));
   
   // Check if ffmpeg process is still alive
   if (ffmpeg.killed || ffmpeg.exitCode !== null) {
-    throw new Error('ffmpeg process failed to start');
+    console.error(`[DEBUG] ffmpeg process failed to start for guild ${guildId}, killed: ${ffmpeg.killed}, exitCode: ${ffmpeg.exitCode}`);
+    throw new Error(`ffmpeg process failed to start (killed: ${ffmpeg.killed}, exitCode: ${ffmpeg.exitCode})`);
   }
+  console.log(`[DEBUG] ffmpeg process confirmed alive for guild ${guildId}`);
 
   // Handle ffmpeg process exit - cleanup and notify
-  ffmpeg.on('exit', (code) => {
+  ffmpeg.on('exit', (code, signal) => {
+    console.log(`[DEBUG] ffmpeg process exited for guild ${guildId}, code: ${code}, signal: ${signal}`);
     if (code !== 0 && code !== null) {
-      console.error(`ffmpeg process exited unexpectedly in guild ${guildId}`);
+      console.error(`[DEBUG] ffmpeg process exited unexpectedly in guild ${guildId} with code ${code}`);
       disconnectGuild(guildId);
     }
   });
 
-  // create resource from ffmpeg stdout (raw PCM 16-bit)
-  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+  // Monitor ffmpeg stdout for data flow
+  let bytesReceived = 0;
+  ffmpeg.stdout.on('data', (chunk) => {
+    bytesReceived += chunk.length;
+    if (bytesReceived % (1024 * 1024) < chunk.length) { // Log every ~1MB
+      console.log(`[DEBUG] ffmpeg stream data flowing for guild ${guildId}, total bytes: ${bytesReceived}`);
+    }
+  });
 
+  ffmpeg.stdout.on('error', (err) => {
+    console.error(`[DEBUG] ffmpeg stdout error for guild ${guildId}:`, err);
+  });
+
+  // create resource from ffmpeg stdout (raw PCM 16-bit)
+  console.log(`[DEBUG] Creating audio resource from ffmpeg stdout for guild ${guildId}`);
+  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+  console.log(`[DEBUG] Audio resource created for guild ${guildId}`);
+
+  console.log(`[DEBUG] Starting playback for guild ${guildId}`);
   player.play(resource);
 
   player.on(AudioPlayerStatus.Playing, () => {
+    console.log(`[DEBUG] Audio player status: Playing for guild ${guildId}`);
     console.log(`🎵 Started playing in guild ${guildId} - Floptropican vibes activated! 💅✨`);
   });
 
+  player.on(AudioPlayerStatus.Buffering, () => {
+    console.log(`[DEBUG] Audio player status: Buffering for guild ${guildId}`);
+  });
+
+  player.on(AudioPlayerStatus.Paused, () => {
+    console.log(`[DEBUG] Audio player status: Paused for guild ${guildId}`);
+  });
+
   player.on('error', error => {
-    console.error('Audio player error:', error);
+    console.error(`[DEBUG] Audio player error for guild ${guildId}:`, error);
+    console.error(`[DEBUG] Audio player error stack:`, error.stack);
     disconnectGuild(guildId);
   });
 
   player.on(AudioPlayerStatus.Idle, () => {
+    console.log(`[DEBUG] Audio player status: Idle for guild ${guildId} - this might indicate a stream issue`);
     console.log(`Player went idle in guild ${guildId} - this might indicate a stream issue`);
   });
 
@@ -217,7 +272,7 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
-    await interaction.reply({ content: `💋✨ Deploying badussy forces to ${memberVoice.name} 🎵🔥 WE ARE CHARLIE CUPCAKKE!!!! 🎧💅`, ephemeral: false });
+    await interaction.reply({ content: `💋✨ Deploying badussy forces to ${memberVoice.name} 🎵🔥 🎧💅`, ephemeral: false });
 
     try {
       await playRadio(memberVoice);

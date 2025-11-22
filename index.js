@@ -1,10 +1,10 @@
 // index.js
-require('dotenv').config(); // optional, if you use .env file for DISCORD_TOKEN
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, AudioPlayerStatus, getVoiceConnection } = require('@discordjs/voice');
-const { spawn } = require('child_process');
-const ffmpegStatic = require('ffmpeg-static');
-
+import dotenv from 'dotenv';
+dotenv.config(); // optional, if you use .env file for DISCORD_TOKEN
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice';
+import { spawn } from 'child_process';
+import ffmpegStatic from 'ffmpeg-static';
 import http from "http";
 http.createServer((req, res) => res.end("Bot is running")).listen(process.env.PORT || 3000);
 

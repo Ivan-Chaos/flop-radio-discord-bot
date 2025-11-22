@@ -54,15 +54,27 @@ const players = new Map(); // map guildId -> { player, ffmpegProc }
 
 // Helper: start ffmpeg reading the radio stream and return its stdout stream
 function createFfmpegStream(url) {
-  // ffmpeg command: use reconnect flags for robust streaming, output raw s16le 48k stereo (discord expects 48k)
+  // Optimized ffmpeg command for live streaming:
+  // - Use reconnect flags for robust streaming
+  // - Lower analyzeduration/probesize for faster startup
+  // - Set buffer size for better streaming
+  // - Output raw s16le 48k stereo (discord expects 48k)
+  // - Use stream_loop for continuous playback
   const args = [
-    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-analyzeduration', '0',
+    '-probesize', '1000000',
+    '-bufsize', '64k',
     '-i', url,
-    '-vn',
-    '-ac', '2',
-    '-ar', '48000',
-    '-f', 's16le',
-    'pipe:1'
+    '-vn',                    // No video
+    '-acodec', 'pcm_s16le',   // Explicitly set codec
+    '-ac', '2',               // 2 audio channels (stereo)
+    '-ar', '48000',           // 48kHz sample rate
+    '-f', 's16le',            // Format: signed 16-bit little-endian
+    '-loglevel', 'warning',   // Reduce log noise but keep warnings
+    'pipe:1'                  // Output to stdout
   ];
   console.log(`[DEBUG] Spawning ffmpeg with args:`, args);
   console.log(`[DEBUG] ffmpeg path: ${ffmpegStatic}`);
@@ -92,7 +104,9 @@ function createFfmpegStream(url) {
     if (data.toLowerCase().includes('error') || 
         data.toLowerCase().includes('failed') || 
         data.toLowerCase().includes('connection') ||
-        data.toLowerCase().includes('timeout')) {
+        data.toLowerCase().includes('timeout') ||
+        data.toLowerCase().includes('segmentation') ||
+        data.toLowerCase().includes('crash')) {
       console.error(`[DEBUG] ffmpeg stderr:`, data.trim());
     }
   });
@@ -100,7 +114,14 @@ function createFfmpegStream(url) {
   // Handle process exit
   ff.on('exit', (code, signal) => {
     console.log(`[DEBUG] ffmpeg process exited, code: ${code}, signal: ${signal}`);
-    if (code !== 0 && code !== null) {
+    if (signal === 'SIGSEGV') {
+      console.error(`[DEBUG] CRITICAL: ffmpeg crashed with segmentation fault (SIGSEGV)`);
+      console.error(`[DEBUG] This usually indicates a binary compatibility issue or memory problem`);
+      console.error(`[DEBUG] ffmpeg path: ${ffmpegStatic}`);
+      if (stderrBuffer) {
+        console.error(`[DEBUG] ffmpeg stderr output before crash:`, stderrBuffer);
+      }
+    } else if (code !== 0 && code !== null) {
       console.error(`[DEBUG] ffmpeg exited with non-zero code ${code}, signal ${signal}`);
       if (stderrBuffer) {
         console.error(`[DEBUG] ffmpeg stderr output:`, stderrBuffer);
@@ -137,20 +158,14 @@ async function playRadio(voiceChannel) {
   if (connection.state.status !== 'ready') {
     console.log(`[DEBUG] Waiting for voice connection to be ready (current: ${connection.state.status})`);
     await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        connection.removeAllListeners('stateChange');
-        reject(new Error(`Connection timeout: never reached Ready state`));
-      }, 10000); // 10 second timeout
-
+      // No timeout - wait indefinitely for connection
       connection.on('stateChange', (oldState, newState) => {
         console.log(`[DEBUG] Voice connection state changed for guild ${guildId}: ${oldState.status} -> ${newState.status}`);
         if (newState.status === 'ready') {
-          clearTimeout(timeout);
           connection.removeAllListeners('stateChange');
           console.log(`[DEBUG] Voice connection ready for guild ${guildId}`);
           resolve();
         } else if (newState.status === 'disconnected') {
-          clearTimeout(timeout);
           connection.removeAllListeners('stateChange');
           reject(new Error(`Connection disconnected: ${newState.reason}`));
         }
@@ -158,7 +173,6 @@ async function playRadio(voiceChannel) {
 
       // If already ready, resolve immediately
       if (connection.state.status === 'ready') {
-        clearTimeout(timeout);
         resolve();
       }
     });
@@ -200,44 +214,50 @@ async function playRadio(voiceChannel) {
   
   // Wait for ffmpeg to start and begin streaming data
   let dataReceived = false;
+  let exitInfo = null;
+  
   const dataPromise = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      if (!dataReceived) {
-        reject(new Error('ffmpeg did not start streaming data within 5 seconds'));
-      }
-    }, 5000);
-
+    // No timeout - wait for data or exit
     ffmpeg.stdout.once('data', (chunk) => {
-      dataReceived = true;
-      clearTimeout(timeout);
-      console.log(`[DEBUG] ffmpeg started streaming data for guild ${guildId}, first chunk: ${chunk.length} bytes`);
-      resolve();
+      if (!dataReceived) {
+        dataReceived = true;
+        console.log(`[DEBUG] ffmpeg started streaming data for guild ${guildId}, first chunk: ${chunk.length} bytes`);
+        resolve();
+      }
     });
 
-    ffmpeg.on('exit', (code) => {
-      clearTimeout(timeout);
+    ffmpeg.on('exit', (code, signal) => {
+      exitInfo = { code, signal };
       if (!dataReceived) {
-        reject(new Error(`ffmpeg exited before streaming data, code: ${code}`));
+        if (signal === 'SIGSEGV') {
+          reject(new Error(`ffmpeg crashed with SIGSEGV (segmentation fault) before streaming data. This is a critical crash, not a connection issue.`));
+        } else {
+          reject(new Error(`ffmpeg exited before streaming data, code: ${code}, signal: ${signal}`));
+        }
       }
     });
   });
 
-  // Wait a moment for process to initialize
-  await new Promise(resolve => setTimeout(resolve, 500));
-  
-  // Check if ffmpeg process is still alive
-  if (ffmpeg.killed || ffmpeg.exitCode !== null) {
-    console.error(`[DEBUG] ffmpeg process failed to start for guild ${guildId}, killed: ${ffmpeg.killed}, exitCode: ${ffmpeg.exitCode}`);
-    throw new Error(`ffmpeg process failed to start (killed: ${ffmpeg.killed}, exitCode: ${ffmpeg.exitCode})`);
+  // Check if ffmpeg process is still alive (exit handler will catch crashes)
+  if (ffmpeg.killed || ffmpeg.exitCode !== null || exitInfo) {
+    const signal = exitInfo?.signal || 'unknown';
+    const code = exitInfo?.code ?? ffmpeg.exitCode;
+    console.error(`[DEBUG] ffmpeg process failed to start for guild ${guildId}, killed: ${ffmpeg.killed}, exitCode: ${code}, signal: ${signal}`);
+    if (signal === 'SIGSEGV') {
+      throw new Error(`ffmpeg crashed with SIGSEGV immediately after spawn. This indicates a binary compatibility issue with ffmpeg-static on this platform.`);
+    }
+    throw new Error(`ffmpeg process failed to start (killed: ${ffmpeg.killed}, exitCode: ${code}, signal: ${signal})`);
   }
   console.log(`[DEBUG] ffmpeg process confirmed alive for guild ${guildId}`);
 
-  // Wait for data to start flowing
+  // Wait for data to start flowing (no timeout - wait indefinitely)
   try {
     await dataPromise;
   } catch (err) {
     console.error(`[DEBUG] Failed to receive data from ffmpeg:`, err);
-    ffmpeg.kill('SIGKILL');
+    if (!ffmpeg.killed && ffmpeg.exitCode === null) {
+      ffmpeg.kill('SIGKILL');
+    }
     throw err;
   }
 

@@ -66,31 +66,44 @@ function createFfmpegStream(url) {
   ];
   console.log(`[DEBUG] Spawning ffmpeg with args:`, args);
   console.log(`[DEBUG] ffmpeg path: ${ffmpegStatic}`);
+  console.log(`[DEBUG] Stream URL: ${url}`);
   const ff = spawn(ffmpegStatic, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   console.log(`[DEBUG] ffmpeg process spawned, PID: ${ff.pid}`);
 
   ff.on('error', err => {
-    console.error('ffmpeg spawn error:', err);
-    console.error('Make sure ffmpeg is installed and in your PATH');
+    console.error(`[DEBUG] ffmpeg spawn error:`, err);
+    console.error(`[DEBUG] Make sure ffmpeg is installed and in your PATH`);
   });
 
   // Log stderr for debugging (ffmpeg outputs info to stderr)
   let stderrBuffer = '';
+  let hasLoggedStart = false;
   ff.stderr.on('data', d => {
-    stderrBuffer += d.toString();
-    // Log errors and important messages
     const data = d.toString();
-    if (data.toLowerCase().includes('error') || data.toLowerCase().includes('failed')) {
-      console.error('ffmpeg error:', data);
+    stderrBuffer += data;
+    
+    // Log initial connection info
+    if (!hasLoggedStart && (data.includes('Stream #') || data.includes('Audio:'))) {
+      console.log(`[DEBUG] ffmpeg stream info:`, data.trim());
+      hasLoggedStart = true;
+    }
+    
+    // Log errors and important messages
+    if (data.toLowerCase().includes('error') || 
+        data.toLowerCase().includes('failed') || 
+        data.toLowerCase().includes('connection') ||
+        data.toLowerCase().includes('timeout')) {
+      console.error(`[DEBUG] ffmpeg stderr:`, data.trim());
     }
   });
 
   // Handle process exit
   ff.on('exit', (code, signal) => {
+    console.log(`[DEBUG] ffmpeg process exited, code: ${code}, signal: ${signal}`);
     if (code !== 0 && code !== null) {
-      console.error(`ffmpeg exited with code ${code}, signal ${signal}`);
+      console.error(`[DEBUG] ffmpeg exited with non-zero code ${code}, signal ${signal}`);
       if (stderrBuffer) {
-        console.error('ffmpeg stderr output:', stderrBuffer);
+        console.error(`[DEBUG] ffmpeg stderr output:`, stderrBuffer);
       }
     }
   });
@@ -120,7 +133,38 @@ async function playRadio(voiceChannel) {
 
   console.log(`[DEBUG] Voice connection created, state: ${connection.state.status}`);
 
-  // Handle connection state changes
+  // Wait for connection to be ready before proceeding
+  if (connection.state.status !== 'ready') {
+    console.log(`[DEBUG] Waiting for voice connection to be ready (current: ${connection.state.status})`);
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        connection.removeAllListeners('stateChange');
+        reject(new Error(`Connection timeout: never reached Ready state`));
+      }, 10000); // 10 second timeout
+
+      connection.on('stateChange', (oldState, newState) => {
+        console.log(`[DEBUG] Voice connection state changed for guild ${guildId}: ${oldState.status} -> ${newState.status}`);
+        if (newState.status === 'ready') {
+          clearTimeout(timeout);
+          connection.removeAllListeners('stateChange');
+          console.log(`[DEBUG] Voice connection ready for guild ${guildId}`);
+          resolve();
+        } else if (newState.status === 'disconnected') {
+          clearTimeout(timeout);
+          connection.removeAllListeners('stateChange');
+          reject(new Error(`Connection disconnected: ${newState.reason}`));
+        }
+      });
+
+      // If already ready, resolve immediately
+      if (connection.state.status === 'ready') {
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+  }
+
+  // Handle connection state changes (after initial ready)
   connection.on('stateChange', (oldState, newState) => {
     console.log(`[DEBUG] Voice connection state changed for guild ${guildId}: ${oldState.status} -> ${newState.status}`);
     if (newState.status === 'disconnected') {
@@ -147,11 +191,38 @@ async function playRadio(voiceChannel) {
   }
 
   // start ffmpeg and pipe into discord
+  if (!RADIO_URL) {
+    throw new Error('RADIO_STREAM_URL environment variable is not set');
+  }
   console.log(`[DEBUG] Starting ffmpeg stream for guild ${guildId}, URL: ${RADIO_URL}`);
   const ffmpeg = createFfmpegStream(RADIO_URL);
   console.log(`[DEBUG] ffmpeg process spawned for guild ${guildId}, PID: ${ffmpeg.pid}`);
   
-  // Wait a moment to ensure ffmpeg starts successfully
+  // Wait for ffmpeg to start and begin streaming data
+  let dataReceived = false;
+  const dataPromise = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      if (!dataReceived) {
+        reject(new Error('ffmpeg did not start streaming data within 5 seconds'));
+      }
+    }, 5000);
+
+    ffmpeg.stdout.once('data', (chunk) => {
+      dataReceived = true;
+      clearTimeout(timeout);
+      console.log(`[DEBUG] ffmpeg started streaming data for guild ${guildId}, first chunk: ${chunk.length} bytes`);
+      resolve();
+    });
+
+    ffmpeg.on('exit', (code) => {
+      clearTimeout(timeout);
+      if (!dataReceived) {
+        reject(new Error(`ffmpeg exited before streaming data, code: ${code}`));
+      }
+    });
+  });
+
+  // Wait a moment for process to initialize
   await new Promise(resolve => setTimeout(resolve, 500));
   
   // Check if ffmpeg process is still alive
@@ -160,6 +231,15 @@ async function playRadio(voiceChannel) {
     throw new Error(`ffmpeg process failed to start (killed: ${ffmpeg.killed}, exitCode: ${ffmpeg.exitCode})`);
   }
   console.log(`[DEBUG] ffmpeg process confirmed alive for guild ${guildId}`);
+
+  // Wait for data to start flowing
+  try {
+    await dataPromise;
+  } catch (err) {
+    console.error(`[DEBUG] Failed to receive data from ffmpeg:`, err);
+    ffmpeg.kill('SIGKILL');
+    throw err;
+  }
 
   // Handle ffmpeg process exit - cleanup and notify
   ffmpeg.on('exit', (code, signal) => {
@@ -185,11 +265,20 @@ async function playRadio(voiceChannel) {
 
   // create resource from ffmpeg stdout (raw PCM 16-bit)
   console.log(`[DEBUG] Creating audio resource from ffmpeg stdout for guild ${guildId}`);
-  const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
+  const resource = createAudioResource(ffmpeg.stdout, { 
+    inputType: StreamType.Raw,
+    inlineVolume: false
+  });
   console.log(`[DEBUG] Audio resource created for guild ${guildId}`);
 
   console.log(`[DEBUG] Starting playback for guild ${guildId}`);
-  player.play(resource);
+  try {
+    player.play(resource);
+    console.log(`[DEBUG] Playback started for guild ${guildId}`);
+  } catch (err) {
+    console.error(`[DEBUG] Failed to start playback:`, err);
+    throw err;
+  }
 
   player.on(AudioPlayerStatus.Playing, () => {
     console.log(`[DEBUG] Audio player status: Playing for guild ${guildId}`);
@@ -213,6 +302,21 @@ async function playRadio(voiceChannel) {
   player.on(AudioPlayerStatus.Idle, () => {
     console.log(`[DEBUG] Audio player status: Idle for guild ${guildId} - this might indicate a stream issue`);
     console.log(`Player went idle in guild ${guildId} - this might indicate a stream issue`);
+    
+    // Check if ffmpeg is still running
+    const entry = players.get(guildId);
+    if (entry && entry.ffmpeg) {
+      const isAlive = !entry.ffmpeg.killed && entry.ffmpeg.exitCode === null;
+      console.log(`[DEBUG] ffmpeg process status - alive: ${isAlive}, killed: ${entry.ffmpeg.killed}, exitCode: ${entry.ffmpeg.exitCode}`);
+      
+      // Check connection state
+      const conn = getVoiceConnection(guildId);
+      if (conn) {
+        console.log(`[DEBUG] Voice connection state: ${conn.state.status}`);
+      } else {
+        console.log(`[DEBUG] Voice connection not found`);
+      }
+    }
   });
 
   // store so we can stop later

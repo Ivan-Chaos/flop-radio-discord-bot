@@ -5,6 +5,10 @@ const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, Au
 const { spawn } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
 
+import http from "http";
+http.createServer((req, res) => res.end("Bot is running")).listen(process.env.PORT || 3000);
+
+
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) {
   console.error('Set DISCORD_TOKEN env var and restart.');

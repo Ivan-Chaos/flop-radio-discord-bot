@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 dotenv.config(); // optional, if you use .env file for DISCORD_TOKEN
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType, AudioPlayerStatus, getVoiceConnection } from '@discordjs/voice';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import ffmpegStatic from 'ffmpeg-static';
 import http from "http";
 http.createServer((req, res) => res.end("Bot is running")).listen(process.env.PORT || 3000);
@@ -52,6 +52,22 @@ const client = new Client({
 
 const players = new Map(); // map guildId -> { player, ffmpegProc }
 
+// Determine which ffmpeg binary to use
+function getFfmpegPath() {
+  // Try to use system ffmpeg first (more reliable on some platforms)
+  try {
+    execSync('which ffmpeg', { stdio: 'ignore' });
+    console.log(`[DEBUG] Using system ffmpeg`);
+    return 'ffmpeg';
+  } catch {
+    // Fall back to ffmpeg-static
+    console.log(`[DEBUG] System ffmpeg not found, using ffmpeg-static: ${ffmpegStatic}`);
+    return ffmpegStatic;
+  }
+}
+
+const FFMPEG_PATH = getFfmpegPath();
+
 // Helper: start ffmpeg reading the radio stream and return its stdout stream
 function createFfmpegStream(url) {
   // Optimized ffmpeg command for live streaming:
@@ -77,9 +93,9 @@ function createFfmpegStream(url) {
     'pipe:1'                  // Output to stdout
   ];
   console.log(`[DEBUG] Spawning ffmpeg with args:`, args);
-  console.log(`[DEBUG] ffmpeg path: ${ffmpegStatic}`);
+  console.log(`[DEBUG] ffmpeg path: ${FFMPEG_PATH}`);
   console.log(`[DEBUG] Stream URL: ${url}`);
-  const ff = spawn(ffmpegStatic, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const ff = spawn(FFMPEG_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   console.log(`[DEBUG] ffmpeg process spawned, PID: ${ff.pid}`);
 
   ff.on('error', err => {
@@ -117,7 +133,8 @@ function createFfmpegStream(url) {
     if (signal === 'SIGSEGV') {
       console.error(`[DEBUG] CRITICAL: ffmpeg crashed with segmentation fault (SIGSEGV)`);
       console.error(`[DEBUG] This usually indicates a binary compatibility issue or memory problem`);
-      console.error(`[DEBUG] ffmpeg path: ${ffmpegStatic}`);
+      console.error(`[DEBUG] ffmpeg path: ${FFMPEG_PATH}`);
+      console.error(`[DEBUG] Suggestion: Install system ffmpeg on your platform (apt-get install ffmpeg / yum install ffmpeg)`);
       if (stderrBuffer) {
         console.error(`[DEBUG] ffmpeg stderr output before crash:`, stderrBuffer);
       }
@@ -230,7 +247,7 @@ async function playRadio(voiceChannel) {
       exitInfo = { code, signal };
       if (!dataReceived) {
         if (signal === 'SIGSEGV') {
-          reject(new Error(`ffmpeg crashed with SIGSEGV (segmentation fault) before streaming data. This is a critical crash, not a connection issue.`));
+          reject(new Error(`ffmpeg crashed with SIGSEGV (segmentation fault) before streaming data. This is a critical crash, not a connection issue. Try installing system ffmpeg on your platform.`));
         } else {
           reject(new Error(`ffmpeg exited before streaming data, code: ${code}, signal: ${signal}`));
         }
@@ -244,7 +261,7 @@ async function playRadio(voiceChannel) {
     const code = exitInfo?.code ?? ffmpeg.exitCode;
     console.error(`[DEBUG] ffmpeg process failed to start for guild ${guildId}, killed: ${ffmpeg.killed}, exitCode: ${code}, signal: ${signal}`);
     if (signal === 'SIGSEGV') {
-      throw new Error(`ffmpeg crashed with SIGSEGV immediately after spawn. This indicates a binary compatibility issue with ffmpeg-static on this platform.`);
+      throw new Error(`ffmpeg crashed with SIGSEGV immediately after spawn. This indicates a binary compatibility issue. Please install system ffmpeg on your platform (e.g., apt-get install ffmpeg).`);
     }
     throw new Error(`ffmpeg process failed to start (killed: ${ffmpeg.killed}, exitCode: ${code}, signal: ${signal})`);
   }
